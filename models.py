@@ -40,28 +40,6 @@ class TrivialSentimentClassifier(SentimentClassifier):
         """
         return 1
 
-
-class NeuralSentimentClassifier(SentimentClassifier):
-    """
-    Implement your NeuralSentimentClassifier here. This should wrap an instance of the network with learned weights
-    along with everything needed to run it on new data (word embeddings, etc.)
-    """
-    def __init__(self):
-        raise NotImplementedError
-
-
-def pad_to_length(np_arr, length):
-    """
-    Forces np_arr to length by either truncation (if longer) or zero-padding (if shorter)
-    :param np_arr:
-    :param length: Length to pad to
-    :return: a new numpy array with the data from np_arr padded to be of length length. If length is less than the
-    length of the base array, truncates instead.
-    """
-    result = np.zeros(length)
-    result[0:np_arr.shape[0]] = np_arr
-    return result
-
 class SentFFNN(nn.Module):
     def __init__(self, input, hid, output):
         super(SentFFNN, self).__init__()
@@ -78,6 +56,46 @@ class SentFFNN(nn.Module):
     def forward(self, x):
         return self.log_softmax(self.W(self.g(self.V(x))))
 
+class NeuralSentimentClassifier(SentimentClassifier):
+    """
+    Implement your NeuralSentimentClassifier here. This should wrap an instance of the network with learned weights
+    along with everything needed to run it on new data (word embeddings, etc.)
+    """
+    def __init__(self, ffnnModel: SentFFNN, word_vectors: WordEmbeddings):
+        self.ffnnModel = ffnnModel
+        self.word_vectors = word_vectors
+
+    def predict(self, ex_words: List[str]) -> int:
+        ex_len = len(ex_words)
+        feat_vec_size = self.word_vectors.get_embedding_length()
+        avg_embed = np.zeros(feat_vec_size)
+        for i in range(ex_len):
+            avg_embed += self.word_vectors.get_embedding(ex_words[i])
+        avg_embed /= ex_len
+
+        avg_embed_input = torch.from_numpy(avg_embed).float()
+
+        log_probs = self.ffnnModel.forward(avg_embed_input)
+        prediction = torch.argmax(log_probs)
+        
+        return prediction
+
+
+
+def pad_to_length(np_arr, length):
+    """
+    Forces np_arr to length by either truncation (if longer) or zero-padding (if shorter)
+    :param np_arr:
+    :param length: Length to pad to
+    :return: a new numpy array with the data from np_arr padded to be of length length. If length is less than the
+    length of the base array, truncates instead.
+    """
+    result = np.zeros(length)
+    result[0:np_arr.shape[0]] = np_arr
+    return result
+
+
+
 def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample], word_vectors: WordEmbeddings) -> NeuralSentimentClassifier:
     """
     Train a feedforward neural network on the given training examples, using dev_exs for development, and returns
@@ -93,8 +111,9 @@ def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentE
     seq_max_len = 60 # This will come in handy for padding I think
 
     lr_rate = 0.0001 # This will need to be adjusted
-    num_epochs = args.num_epochs
-    hidden_size = args.hidden_size ## This will need to be adjusted
+    num_epochs = 15
+    hidden_size = 200
+    #hidden_size = args.hidden_size ## This will need to be adjusted
     batch_size = args.batch_size
 
     num_train_exs = len(train_exs)
@@ -107,46 +126,39 @@ def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentE
     # Setting up optimizer
     optimizer = optim.Adam(ffnn.parameters(), lr=lr_rate)
 
-    total_loss = 0.0
-    for i in range(num_train_exs):
+    for epoch in range(num_epochs):
+        ex_indices = [i for i in range(num_train_exs)]
+        random.shuffle(ex_indices)
 
-        sent_ex = train_exs[i]
-        sent_words = sent_ex.words
-        sent_label = sent_ex.label
-        sent_ex_len = len(sent_words)
+        total_loss = 0.0
+        for idx in ex_indices:
 
-        # Averaging word embeddings across all words in the sentence
-        avg_embed = np.zeros(feat_vector_size)
-        for j in range(sent_ex_len):
-            avg_embed += word_vectors.get_embedding(sent_words[j])
-        avg_embed /= sent_ex_len
+            sent_ex = train_exs[idx]
+            sent_words = sent_ex.words
+            sent_label = sent_ex.label
+            sent_ex_len = len(sent_words)
 
-        avg_embed_input = torch.from_numpy(avg_embed).float()
-        y_onehot = torch.zeros(num_labels)
-        y_onehot.scatter_(0, torch.from_numpy(np.asarray(sent_label,dtype=np.int64)), 1)
-        print("Sentiment label: ", sent_label)
-        print(y_onehot)
+            # Averaging word embeddings across all words in the sentence
+            avg_embed = np.zeros(feat_vector_size)
+            for j in range(sent_ex_len):
+                avg_embed += word_vectors.get_embedding(sent_words[j])
+            avg_embed /= sent_ex_len
 
-        ffnn.zero_grad()
-        log_probs = ffnn.foward(avg_embed_input)
-        loss = torch.neg(log_probs).dot(y_onehot)
+            avg_embed_input = torch.from_numpy(avg_embed).float()
 
-        total_loss += loss
-        loss.backward()
-        optimizer.step()
-        
-    for i in range(num_train_exs):
-        
-        sent_ex = train_exs[i]
-        sent_words = sent_ex.words
-        sent_label = sent_ex.label
-        print("First Sentiment Example")
-        print(sent_ex)
-        print("First word: ", sent_words[0])
-        print("First word embedding: ", word_vectors.get_embedding(sent_words[0]))
-        break
+            y_onehot = torch.zeros(num_labels)
+            y_onehot.scatter_(0, torch.from_numpy(np.asarray(sent_label,dtype=np.int64)), 1)
 
-    raise Exception("Not implemented")
+            ffnn.zero_grad()
+            log_probs = ffnn.forward(avg_embed_input)
+            loss = torch.neg(log_probs).dot(y_onehot)
+
+            total_loss += loss
+            loss.backward()
+            optimizer.step()
+        print("Total loss on epoch %i: %f" % (epoch, total_loss))
+    
+    return NeuralSentimentClassifier(ffnn, word_vectors)
 
 
 # Analogous to train_ffnn, but trains your fancier model.
