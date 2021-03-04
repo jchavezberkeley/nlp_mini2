@@ -3,6 +3,9 @@
 import numpy as np
 import random
 from sentiment_data import *
+import torch
+import torch.nn as nn
+from torch import optim
 
 
 class SentimentClassifier(object):
@@ -59,6 +62,21 @@ def pad_to_length(np_arr, length):
     result[0:np_arr.shape[0]] = np_arr
     return result
 
+class SentFFNN(nn.Module):
+    def __init__(self, input, hid, output):
+        super(SentFFNN, self).__init__()
+        self.V = nn.Linear(input, hid)
+        #self.g = nn.Tanh()
+        self.g = nn.ReLU()
+        self.W = nn.Linear(hid, output)
+        self.log_softmax = nn.LogSoftmax(dim=0)
+        
+        # Initialize weights according to a formula due to Xavier Glorot.
+        nn.init.xavier_uniform_(self.V.weight)
+        nn.init.xavier_uniform_(self.W.weight)
+
+    def forward(self, x):
+        return self.log_softmax(self.W(self.g(self.V(x))))
 
 def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample], word_vectors: WordEmbeddings) -> NeuralSentimentClassifier:
     """
@@ -72,7 +90,62 @@ def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentE
     prediction on new examples
     """
     # 59 is the max sentence length in the corpus, so let's set this to 60
-    seq_max_len = 60
+    seq_max_len = 60 # This will come in handy for padding I think
+
+    lr_rate = 0.0001 # This will need to be adjusted
+    num_epochs = args.num_epochs
+    hidden_size = args.hidden_size ## This will need to be adjusted
+    batch_size = args.batch_size
+
+    num_train_exs = len(train_exs)
+    num_labels = 2
+
+    # Setting up input side and hidden size in SentFFNN
+    feat_vector_size = word_vectors.get_embedding_length()
+    ffnn = SentFFNN(feat_vector_size, hidden_size, num_labels)
+
+    # Setting up optimizer
+    optimizer = optim.Adam(ffnn.parameters(), lr=lr_rate)
+
+    total_loss = 0.0
+    for i in range(num_train_exs):
+
+        sent_ex = train_exs[i]
+        sent_words = sent_ex.words
+        sent_label = sent_ex.label
+        sent_ex_len = len(sent_words)
+
+        # Averaging word embeddings across all words in the sentence
+        avg_embed = np.zeros(feat_vector_size)
+        for j in range(sent_ex_len):
+            avg_embed += word_vectors.get_embedding(sent_words[j])
+        avg_embed /= sent_ex_len
+
+        avg_embed_input = torch.from_numpy(avg_embed).float()
+        y_onehot = torch.zeros(num_labels)
+        y_onehot.scatter_(0, torch.from_numpy(np.asarray(sent_label,dtype=np.int64)), 1)
+        print("Sentiment label: ", sent_label)
+        print(y_onehot)
+
+        ffnn.zero_grad()
+        log_probs = ffnn.foward(avg_embed_input)
+        loss = torch.neg(log_probs).dot(y_onehot)
+
+        total_loss += loss
+        loss.backward()
+        optimizer.step()
+        
+    for i in range(num_train_exs):
+        
+        sent_ex = train_exs[i]
+        sent_words = sent_ex.words
+        sent_label = sent_ex.label
+        print("First Sentiment Example")
+        print(sent_ex)
+        print("First word: ", sent_words[0])
+        print("First word embedding: ", word_vectors.get_embedding(sent_words[0]))
+        break
+
     raise Exception("Not implemented")
 
 
