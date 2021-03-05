@@ -6,6 +6,7 @@ from sentiment_data import *
 import torch
 import torch.nn as nn
 from torch import optim
+import torch.nn.functional as F
 
 
 class SentimentClassifier(object):
@@ -55,6 +56,27 @@ class SentFFNN(nn.Module):
 
     def forward(self, x):
         return self.log_softmax(self.W(self.g(self.V(x))))
+
+class SentLSTM(nn.Module):
+    def __init__(self, inp, hid, out):
+        super(SentLSTM, self).__init__()
+        self.input_size = inp
+        self.hidden_size = hid
+        self.output_size = out
+        self.lstm = nn.LSTM(self.input_size, self.hidden_size)
+        self.linear = nn.Linear(self.hidden_size, self.output_size)
+
+    def forward(self, x):
+        assert(self.lstm.input_size == 50)
+        assert(self.linear.out_features == 2)
+        assert(self.output_size == 2)
+        lstm_out, _ = self.lstm(x.view(1, 1, -1))
+        print("LSTM OUT: ", lstm_out.shape)
+        out_space = self.linear(lstm_out.view(1, -1))
+        print("Out Space: ", out_space)
+        tag_scores = F.log_softmax(out_space, dim=0)
+        return tag_scores
+
 
 class NeuralSentimentClassifier(SentimentClassifier):
     """
@@ -163,4 +185,50 @@ def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentE
 
 # Analogous to train_ffnn, but trains your fancier model.
 def train_fancy(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample], word_vectors: WordEmbeddings) -> NeuralSentimentClassifier:
+    lr_rate = 0.001
+    num_epochs = 10
+    hidden_size = 20
+    num_train_exs = len(train_exs)
+    num_labels = 2
+
+    # Setting up input side and hidden size in SentLSTM
+    feat_vector_size = word_vectors.get_embedding_length()
+    lstm_model = SentLSTM(feat_vector_size, hidden_size, num_labels)
+
+    # Setting up optimizer
+    optimizer = optim.Adam(lstm_model.parameters(), lr=lr_rate)
+
+    for epoch in range(num_epochs):
+        ex_indices = [i for i in range(num_train_exs)]
+        random.shuffle(ex_indices)
+
+        total_loss = 0.0
+        for idx in ex_indices:
+            sent_ex = train_exs[idx]
+            sent_words = sent_ex.words
+            sent_label = sent_ex.label
+            sent_ex_len = len(sent_words)
+
+            # Averaging word embeddings across all words in the sentence
+            avg_embed = np.zeros(feat_vector_size)
+            for j in range(sent_ex_len):
+                avg_embed += word_vectors.get_embedding(sent_words[j])
+            avg_embed /= sent_ex_len
+
+            avg_embed_input = torch.from_numpy(avg_embed).float()
+            print("Shape of avg word embedding: ", avg_embed_input.shape)
+            y_onehot = torch.zeros(num_labels)
+            y_onehot.scatter_(0, torch.from_numpy(np.asarray(sent_label,dtype=np.int64)), 1)
+
+            lstm_model.zero_grad()
+            log_probs = lstm_model.forward(avg_embed_input)
+            print("Log probs: ", log_probs)
+            loss = torch.neg(log_probs).dot(y_onehot)
+
+            total_loss += loss
+            loss.backward()
+            optimizer.step()
+            break
+        print("Total loss on epoch %i: %f" % (epoch, total_loss))
+
     raise Exception("Not implemented")
