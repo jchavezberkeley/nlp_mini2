@@ -57,25 +57,6 @@ class SentFFNN(nn.Module):
     def forward(self, x):
         return self.log_softmax(self.W(self.g(self.V(x))))
 
-class SentLSTM(nn.Module):
-    def __init__(self, inp, hid, out):
-        super(SentLSTM, self).__init__()
-        self.input_size = inp
-        self.hidden_size = hid
-        self.output_size = out
-        self.lstm = nn.LSTM(self.input_size, self.hidden_size)
-        self.linear = nn.Linear(self.hidden_size, self.output_size)
-
-    def forward(self, x):
-        assert(self.lstm.input_size == 50)
-        assert(self.linear.out_features == 2)
-        assert(self.output_size == 2)
-        lstm_out, _ = self.lstm(x.view(1, 1, -1))
-        print("LSTM OUT: ", lstm_out.shape)
-        out_space = self.linear(lstm_out.view(1, -1))
-        print("Out Space: ", out_space)
-        tag_scores = F.log_softmax(out_space, dim=0)
-        return tag_scores
 
 
 class NeuralSentimentClassifier(SentimentClassifier):
@@ -83,22 +64,41 @@ class NeuralSentimentClassifier(SentimentClassifier):
     Implement your NeuralSentimentClassifier here. This should wrap an instance of the network with learned weights
     along with everything needed to run it on new data (word embeddings, etc.)
     """
-    def __init__(self, ffnnModel: SentFFNN, word_vectors: WordEmbeddings):
-        self.ffnnModel = ffnnModel
+    def __init__(self, model, word_vectors: WordEmbeddings, isLSTM=False, embeddings=None):
+        self.model = model
         self.word_vectors = word_vectors
+        self.isLSTM = isLSTM
+        self.embeddings = embeddings
 
     def predict(self, ex_words: List[str]) -> int:
         ex_len = len(ex_words)
         feat_vec_size = self.word_vectors.get_embedding_length()
-        avg_embed = np.zeros(feat_vec_size)
-        for i in range(ex_len):
-            avg_embed += self.word_vectors.get_embedding(ex_words[i])
-        avg_embed /= ex_len
+        
+        if self.isLSTM:
+            word_indices = np.zeros(ex_len, dtype=int)
+            for i in range(ex_len):
+                index_from_indexer = self.word_vectors.word_indexer.index_of(ex_words[i])
+                if index_from_indexer == -1:
+                    index_to_append = 1
+                else:
+                    index_to_append = index_from_indexer
+                word_indices[i] = index_to_append
 
-        avg_embed_input = torch.from_numpy(avg_embed).float()
+            word_indices = torch.from_numpy(word_indices).type(torch.LongTensor)
+            embed_input = self.embeddings(word_indices)
+            log_probs = self.model.forward(embed_input)
+            prediction = torch.argmax(log_probs)
+            
+        else:
+            avg_embed = np.zeros(feat_vec_size)
+            for i in range(ex_len):
+                avg_embed += self.word_vectors.get_embedding(ex_words[i])
+            avg_embed /= ex_len
 
-        log_probs = self.ffnnModel.forward(avg_embed_input)
-        prediction = torch.argmax(log_probs)
+            avg_embed_input = torch.from_numpy(avg_embed).float()
+
+            log_probs = self.model.forward(avg_embed_input)
+            prediction = torch.argmax(log_probs)
         
         return prediction
 
@@ -113,9 +113,34 @@ def pad_to_length(np_arr, length):
     length of the base array, truncates instead.
     """
     result = np.zeros(length)
-    result[0:np_arr.shape[0]] = np_arr
+    result[-np_arr.shape[0]:-1] = np_arr
     return result
 
+
+class SentLSTM(nn.Module):
+    def __init__(self, inp, hid, out, seq_max_len):
+        super(SentLSTM, self).__init__()
+        self.num_layers = 1
+        self.input_size = inp
+        self.hidden_size = hid
+        self.output_size = out
+        self.seq_max_len = seq_max_len
+        
+        self.lstm = nn.LSTM(self.input_size, self.hidden_size, batch_first=True)
+        self.linear = nn.Linear(self.hidden_size, self.output_size)
+
+    def forward(self, x):
+        input_x = torch.unsqueeze(x, 0)
+
+        h_0 = torch.zeros(self.num_layers, input_x.size(0), self.hidden_size) #hidden state
+        c_0 = torch.zeros(self.num_layers, input_x.size(0), self.hidden_size) #internal state
+
+        lstm_out, (hn, cn) = self.lstm(input_x, (h_0, c_0))
+        hidden = hn.squeeze()
+
+        out_space = self.linear(hidden)
+        tag_scores = F.log_softmax(out_space, dim=0)
+        return tag_scores
 
 
 def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample], word_vectors: WordEmbeddings) -> NeuralSentimentClassifier:
@@ -185,18 +210,26 @@ def train_ffnn(args, train_exs: List[SentimentExample], dev_exs: List[SentimentE
 
 # Analogous to train_ffnn, but trains your fancier model.
 def train_fancy(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample], word_vectors: WordEmbeddings) -> NeuralSentimentClassifier:
-    lr_rate = 0.001
-    num_epochs = 10
-    hidden_size = 20
+    lr_rate = args.lr
+    num_epochs = args.num_epochs
+    hidden_size = args.hidden_size
+    
+    batch_size = args.batch_size
+
     num_train_exs = len(train_exs)
     num_labels = 2
+    seq_max_len = 60
 
     # Setting up input side and hidden size in SentLSTM
     feat_vector_size = word_vectors.get_embedding_length()
-    lstm_model = SentLSTM(feat_vector_size, hidden_size, num_labels)
+    lstm_model = SentLSTM(feat_vector_size, hidden_size, num_labels, seq_max_len)
 
     # Setting up optimizer
     optimizer = optim.Adam(lstm_model.parameters(), lr=lr_rate)
+
+    embedding_weights = torch.FloatTensor(word_vectors.vectors)
+    embeddings = nn.Embedding.from_pretrained(embedding_weights)
+    embeddings.weight.requires_grad = False
 
     for epoch in range(num_epochs):
         ex_indices = [i for i in range(num_train_exs)]
@@ -209,26 +242,28 @@ def train_fancy(args, train_exs: List[SentimentExample], dev_exs: List[Sentiment
             sent_label = sent_ex.label
             sent_ex_len = len(sent_words)
 
-            # Averaging word embeddings across all words in the sentence
-            avg_embed = np.zeros(feat_vector_size)
-            for j in range(sent_ex_len):
-                avg_embed += word_vectors.get_embedding(sent_words[j])
-            avg_embed /= sent_ex_len
+            word_indices = np.zeros(sent_ex_len, dtype=int)
+            for i in range(sent_ex_len):
+                index_from_indexer = word_vectors.word_indexer.index_of(sent_words[i])
+                if index_from_indexer == -1:
+                    index_to_append = 1
+                else:
+                    index_to_append = index_from_indexer
+                word_indices[i] = index_to_append
 
-            avg_embed_input = torch.from_numpy(avg_embed).float()
-            print("Shape of avg word embedding: ", avg_embed_input.shape)
+            word_indices = torch.from_numpy(word_indices).type(torch.LongTensor)
+            embed_input = embeddings(word_indices)
+
             y_onehot = torch.zeros(num_labels)
             y_onehot.scatter_(0, torch.from_numpy(np.asarray(sent_label,dtype=np.int64)), 1)
 
             lstm_model.zero_grad()
-            log_probs = lstm_model.forward(avg_embed_input)
-            print("Log probs: ", log_probs)
+            log_probs = lstm_model.forward(embed_input)
             loss = torch.neg(log_probs).dot(y_onehot)
 
             total_loss += loss
             loss.backward()
             optimizer.step()
-            break
         print("Total loss on epoch %i: %f" % (epoch, total_loss))
 
-    raise Exception("Not implemented")
+    return NeuralSentimentClassifier(lstm_model, word_vectors, True, embeddings)
